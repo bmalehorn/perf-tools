@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 #
 # opensnoop - trace open() syscalls with file details.
 #             Written using Linux ftrace.
@@ -47,7 +47,6 @@
 
 ### default variables
 tracing=/sys/kernel/debug/tracing
-flock=/var/tmp/.ftrace-lock; wroteflock=0
 opt_duration=0; duration=; opt_name=0; name=; opt_pid=0; pid=; ftext=
 opt_time=0; opt_fail=0; opt_file=0; file=
 trap ':' INT QUIT TERM PIPE HUP	# sends execution to end tracing section
@@ -85,15 +84,15 @@ function end {
 	echo 2>/dev/null
 	echo "Ending tracing..." 2>/dev/null
 	cd $tracing
-	warn "echo 0 > events/kprobes/getnameprobe/enable"
-	warn "echo 0 > events/syscalls/sys_exit_open/enable"
-	if (( opt_pid )); then
-		warn "echo 0 > events/kprobes/getnameprobe/filter"
-		warn "echo 0 > events/syscalls/sys_exit_open/filter"
+	warn "echo 0 > events/kprobes/openstart/enable"
+	warn "echo 0 > events/kprobes/openend/enable"
+	if [ "$opt_pid" -gt 0 ]; then
+		warn "echo 0 > events/kprobes/openstart/filter"
+		warn "echo 0 > events/kprobes/openend/filter"
 	fi
-	warn "echo -:getnameprobe >> kprobe_events"
+	warn "echo -:openstart >> kprobe_events"
+	warn "echo -:openend >> kprobe_events"
 	warn "echo > trace"
-	(( wroteflock )) && warn "rm $flock"
 }
 
 function die {
@@ -122,26 +121,28 @@ do
 	esac
 done
 shift $(( $OPTIND - 1 ))
-if (( $# )); then
+if [ "$#" -gt 0 ]; then
 	opt_file=1
 	file=$1
 	shift
 fi
-(( $# )) && usage
+[ "$#" -gt 0 ] && usage
 
 ### option logic
-(( opt_pid && opt_name )) && die "ERROR: use either -p or -n."
-(( opt_pid )) && ftext=" issued by PID $pid"
-(( opt_name )) && ftext=" issued by process name \"$name\""
-(( opt_file )) && ftext="$ftext for filenames containing \"$file\""
-if (( opt_duration )); then
+: $opt_pid
+: $opt_name
+[ "$opt_pid" -gt 0 ] && [ "$opt_name" -gt 0 ] && die "ERROR: use either -p or -n."
+[ "$opt_pid" -gt 0 ] && ftext=" issued by PID $pid"
+[ "$opt_name" -gt 0 ] && ftext=" issued by process name \"$name\""
+[ "$opt_file" -gt 0 ] && ftext="$ftext for filenames containing \"$file\""
+if [ "$opt_duration" -gt 0 ]; then
 	echo "Tracing open()s$ftext for $duration seconds (buffered)..."
 else
 	echo "Tracing open()s$ftext. Ctrl-C to end."
 fi
 
 ### select awk
-(( opt_duration )) && use=mawk || use=gawk	# workaround for mawk fflush()
+[ "$opt_duration" -gt 0 ] && use=mawk || use=gawk	# workaround for mawk fflush()
 [[ -x /usr/bin/$use ]] && awk=$use || awk=awk
 
 ### check permissions
@@ -149,37 +150,26 @@ cd $tracing || die "ERROR: accessing tracing. Root user? Kernel has FTRACE?
     debugfs mounted? (mount -t debugfs debugfs /sys/kernel/debug)"
 
 ### ftrace lock
-[[ -e $flock ]] && die "ERROR: ftrace may be in use by PID $(cat $flock) $flock"
-echo $$ > $flock || die "ERROR: unable to write $flock."
-wroteflock=1
-
 ### setup and begin tracing
 echo nop > current_tracer
-ver=$(uname -r)
-if [[ "$ver" == 2.* || "$ver" == 3.[1-6].* ]]; then
-	# rval is char *
-	kprobe='r:getnameprobe getname +0($retval):string'
-else
-	# rval is struct filename *
-	kprobe='r:getnameprobe getname +0(+0($retval)):string'
-fi
-if ! echo $kprobe >> kprobe_events; then
+if ! echo 'r:openend do_sys_open $retval' >> kprobe_events ||
+	! echo 'p:openstart do_sys_open filename=+0(%r1):string' >> kprobe_events; then
 	edie "ERROR: adding a kprobe for getname(). Exiting."
 fi
-if (( opt_pid )); then
-	if ! echo "common_pid==$pid" > events/kprobes/getnameprobe/filter || \
-	    ! echo "common_pid==$pid" > events/syscalls/sys_exit_open/filter
+if [ "$opt_pid" -gt 0 ]; then
+	if ! echo "common_pid==$pid" > events/kprobes/openstart/filter || \
+	    ! echo "common_pid==$pid" > events/kprobes/openend/filter
 	then
 	    edie "ERROR: setting -p $pid. Exiting."
 	fi
 fi
-if ! echo 1 > events/kprobes/getnameprobe/enable; then
+if ! echo 1 > events/kprobes/openstart/enable; then
 	edie "ERROR: enabling kprobe for getname(). Exiting."
 fi
-if ! echo 1 > events/syscalls/sys_exit_open/enable; then
+if ! echo 1 > events/kprobes/openend/enable; then
 	edie "ERROR: enabling open() exit tracepoint. Exiting."
 fi
-(( opt_time )) && printf "%-16s " "TIMEs"
+[ "$opt_time" -gt 0 ] && printf "%-16s " "TIMEs"
 printf "%-16.16s %-6s %4s %s\n" "COMM" "PID" "FD" "FILE"
 
 #
@@ -195,7 +185,7 @@ offset=$($awk 'BEGIN { o = 0; }
 
 ### print trace buffer
 warn "echo > trace"
-( if (( opt_duration )); then
+( if [ "$opt_duration" -gt 0 ]; then
 	# wait then dump buffer
 	sleep $duration
 	cat trace
@@ -218,7 +208,7 @@ fi ) | $awk -v o=$offset -v opt_name=$opt_name -v name=$name \
 	}
 
 	# do_sys_open()
-	$1 != "#" && $(5+o) ~ /do_sys_open/ {
+	$1 != "#" && $0 ~ /openstart/ {
 		#
 		# eg: ... (do_sys_open+0xc3/0x220 <- getname) arg1="file1"
 		#
@@ -229,16 +219,17 @@ fi ) | $awk -v o=$offset -v opt_name=$opt_name -v name=$name \
 	}
 
 	# sys_open()
-	$1 != "#" && $(4+o) == "sys_open" {
+	$1 != "#" && $0 ~ /openend/ {
 		filename = lastfile[pid]
 		delete lastfile[pid]
 		if (opt_file && filename !~ file)
 			next
 		rval = $NF
-		# matched failed as beginning with 0xfffff
-		if (opt_fail && rval !~ /0xfffff/)
+		sub(/arg1=/, "", rval)
+		# matched failed as beginning with ffffff
+		if (opt_fail && rval !~ /ffffff/)
 			next
-		if (rval ~ /0xfffff/)
+		if (rval ~ /ffffff/)
 			rval = -1
 
 		if (opt_time) {
